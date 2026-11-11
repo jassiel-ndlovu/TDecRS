@@ -50,8 +50,12 @@ def loadData(path):
 
 class FMData(data.Dataset):
     """ Construct the FM training dataset."""
-    def __init__(self, train_path, user_feature, item_feature, loss_type, negative_num=1):
+    def __init__(self, train_path, user_feature, item_feature, loss_type, negative_num=1,
+                 confounder=None):
         super(FMData, self).__init__()
+        # DCR: optional (N_train, num_groups) per-row confounder, row-aligned with
+        # train_path. None keeps the legacy 3-tuple behaviour exactly.
+        self.confounder = None if confounder is None else confounder.astype('float32')
         self.user_feature = user_feature
         self.item_feature = item_feature
         self.loss_type = loss_type
@@ -88,6 +92,7 @@ class FMData(data.Dataset):
         self.label = self.pos_label
         self.features = self.pos_features
         self.feature_values = self.pos_feature_values
+        self.all_conf = self.confounder
         
     def ng_sample(self):
         
@@ -114,6 +119,10 @@ class FMData(data.Dataset):
         self.features = self.pos_features + neg_features
         self.feature_values = self.pos_feature_values + neg_feature_values
         self.label = self.pos_label + neg_label
+        if self.confounder is not None:
+            # one negative per positive, generated in train_list order, so the
+            # negative half reuses the same per-row confounders
+            self.all_conf = np.concatenate([self.confounder, self.confounder], 0)
         
         assert len(self.features) == len(self.feature_values) == len(self.label)
         assert all(len(item) == len(self.features[0]
@@ -127,7 +136,9 @@ class FMData(data.Dataset):
         features = self.features[idx]
         feature_values = self.feature_values[idx]
         
-        return features, feature_values, label
+        if self.all_conf is None:
+            return features, feature_values, label
+        return features, feature_values, label, self.all_conf[idx]
     
     
     

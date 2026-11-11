@@ -1,14 +1,15 @@
 import numpy as np 
 import torch
+from device import get_device
 import math
 import time
 
 def RMSE(model, model_name, dataloader, CF_inference_models):
     RMSE = np.array([], dtype=np.float32)
     for features, feature_values, label in dataloader:
-        features = features.cuda()
-        feature_values = feature_values.cuda()
-        label = label.cuda()
+        features = features.to(get_device())
+        feature_values = feature_values.to(get_device())
+        label = label.to(get_device())
 
         if model_name in CF_inference_models:
             prediction = model(features, feature_values, 'train')            
@@ -29,8 +30,8 @@ def pre_candidate_ranking(train_dict, valid_dict, test_dict, item_category, num_
         all_item_features.append(np.array(item_feature[itemID][0]))
         all_item_feature_values.append(np.array(item_feature[itemID][1], dtype=np.float32))
     
-    all_item_features = torch.tensor(all_item_features).cuda()
-    all_item_feature_values = torch.tensor(all_item_feature_values).cuda()
+    all_item_features = torch.tensor(np.array(all_item_features)).to(get_device())
+    all_item_feature_values = torch.tensor(np.array(all_item_feature_values, dtype=np.float32)).to(get_device())
 
     user_kl_score = {}
     max_kl_score = 0
@@ -58,8 +59,8 @@ def selected_concat(user_feat, user_feat_values, all_item_features, all_item_fea
 #     candidates_indexes = []
 #     for itemID in candidates:
 #         candidates_indexes.append(item_idx.index(itemID))
-#     candidates_indexes = torch.tensor(candidates_indexes).cuda()
-    candidates_indexes = torch.tensor(candidates).cuda()
+#     candidates_indexes = torch.tensor(candidates_indexes).to(get_device())
+    candidates_indexes = torch.tensor(candidates).to(get_device())
     candidate_feature = all_item_features[candidates_indexes] 
     candidate_feature_values = all_item_feature_values[candidates_indexes] 
 
@@ -84,8 +85,8 @@ def candidate_ranking(model, model_name, valid_dict, test_dict, train_dict, \
     for userID in test_dict:
 
         candidates = user_candidate[userID]
-        user_feat = torch.tensor(np.array(user_feature[userID][0])).cuda()
-        user_feat_values = torch.tensor(np.array(user_feature[userID][1], dtype=np.float32)).cuda()
+        user_feat = torch.tensor(np.array(user_feature[userID][0])).to(get_device())
+        user_feat_values = torch.tensor(np.array(user_feature[userID][1], dtype=np.float32)).to(get_device())
 
         item_idx = list(item_feature.keys())
         features, feature_values = selected_concat(user_feat, user_feat_values, \
@@ -106,8 +107,8 @@ def candidate_ranking(model, model_name, valid_dict, test_dict, train_dict, \
     for userID in test_dict:
 
         candidates = user_candidate[userID]
-        FM_item_scores = torch.tensor(FM_score[userID]).cuda()
-        all_predictions = torch.tensor(user_pred_dict[userID]).cuda()
+        FM_item_scores = torch.tensor(FM_score[userID]).to(get_device())
+        all_predictions = torch.tensor(user_pred_dict[userID]).to(get_device())
         lamda = ((user_kl_score[userID] - user_kl_score['min_kl_score'])/kl_score_gap)**alpha
         DecFM_score =  lamda * torch.sigmoid(all_predictions) + (1-lamda) * torch.sigmoid(FM_item_scores)
 

@@ -1,4 +1,5 @@
 import torch
+from device import get_device
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -28,11 +29,11 @@ class DecFM(nn.Module):
 
         if confounder_prior is not None:
             # \bar{d} in the paper
-            self.confounder_prior = torch.tensor(confounder_prior, dtype=torch.float32).cuda().unsqueeze(dim=-1)
+            self.confounder_prior = torch.tensor(confounder_prior, dtype=torch.float32).to(get_device()).unsqueeze(dim=-1)
         else:
             # confounder prior is assumed as [1/n, 1/n, ..., 1/n]
             self.confounder_prior = \
-                    torch.tensor([1.0/num_groups for x in range(num_groups)]).cuda().unsqueeze(dim=-1)
+                    torch.tensor([1.0/num_groups for x in range(num_groups)]).to(get_device()).unsqueeze(dim=-1)
 
         FM_modules = []
         if self.batch_norm:
@@ -44,13 +45,17 @@ class DecFM(nn.Module):
         nn.init.constant_(self.biases.weight, 0.0)
 
 
-    def forward(self, features, feature_values):
+    def forward(self, features, feature_values, confounder=None):
+        """confounder: optional (N, num_groups) per-row prior for DCR.
+        When None the static self.confounder_prior is used, which keeps the
+        DecRS path numerically identical to before this change."""
         
         ### U & D => M: use FM to calculate M(\bar{d}, u)
         # map the id of group features. eg., [123, 124, 125] => [0, 1, 2]
         confounder_part = features[:, -self.num_groups:] - torch.min(features[:, -self.num_groups:])
         confounder_embed = self.confounder_embed(confounder_part) # N*num_groups*hidden_factor
-        weighted_confounder_embed = confounder_embed * self.confounder_prior
+        prior = self.confounder_prior if confounder is None else confounder.unsqueeze(dim=-1)
+        weighted_confounder_embed = confounder_embed * prior
         
         user_features = features[:, :self.num_user_features]
         user_feature_values = feature_values[:, :self.num_user_features].unsqueeze(dim=-1)
@@ -107,10 +112,10 @@ class DecNFM(nn.Module):
         self.drop_prob = drop_prob
         
         if confounder_prior is not None:
-            self.confounder_prior = torch.tensor(confounder_prior, dtype=torch.float32).cuda().unsqueeze(dim=-1)
+            self.confounder_prior = torch.tensor(confounder_prior, dtype=torch.float32).to(get_device()).unsqueeze(dim=-1)
         else:
             self.confounder_prior = \
-                    torch.tensor([1.0/num_groups for x in range(num_groups)]).cuda().unsqueeze(dim=-1)
+                    torch.tensor([1.0/num_groups for x in range(num_groups)]).to(get_device()).unsqueeze(dim=-1)
             
         self.embeddings = nn.Embedding(num_features, num_factors)
         self.confounder_embed = nn.Embedding(num_groups, num_factors)
@@ -161,13 +166,17 @@ class DecNFM(nn.Module):
         else:
             nn.init.constant_(self.prediction.weight, 1.0)    
             
-    def forward(self, features, feature_values):
+    def forward(self, features, feature_values, confounder=None):
+        """confounder: optional (N, num_groups) per-row prior for DCR.
+        When None the static self.confounder_prior is used, which keeps the
+        DecRS path numerically identical to before this change."""
         
         ### U & D => M: use FM to calculate M(\bar{d}, u)
         # map the id of group features. eg., [123, 124, 125] => [0, 1, 2]
         confounder_part = features[:, -self.num_groups:] - torch.min(features[:, -self.num_groups:])
         confounder_embed = self.confounder_embed(confounder_part) # N*num_confoudners*hidden_factor
-        weighted_confounder_embed = confounder_embed * self.confounder_prior
+        prior = self.confounder_prior if confounder is None else confounder.unsqueeze(dim=-1)
+        weighted_confounder_embed = confounder_embed * prior
         
         user_features = features[:, :self.num_user_features]
         user_feature_values = feature_values[:, :self.num_user_features].unsqueeze(dim=-1)
@@ -256,6 +265,110 @@ class FM(nn.Module):
         feature_bias = self.biases(features)
         feature_bias = (feature_bias * feature_values).sum(dim=1)
         FM = FM + feature_bias + self.bias_
+        return FM.view(-1)
+
+
+class FMconf(FM):
+    """Tier 1.5 control: FM with the DCR confounder as plain side features.
+
+    The 18 genre-group weights of d_u enter as 18 extra weighted features of an
+    ordinary FM -- the same information DCR gets, the same parameter count as
+    DecFM's confounder_embed (+18 biases), but no mediator M(d, u) and no
+    backdoor adjustment. If this matches DCR, DCR's ML-1M gain is the recency
+    information, not the deconfounding structure.
+    """
+    def __init__(self, num_features, num_groups, num_factors, batch_norm, drop_prob,
+                 confounder_prior):
+        super(FMconf, self).__init__(num_features, num_factors, batch_norm, drop_prob)
+        self.num_groups = num_groups
+        self.confounder_embed = nn.Embedding(num_groups, num_factors)
+        self.confounder_bias = nn.Embedding(num_groups, 1)
+        nn.init.normal_(self.confounder_embed.weight, std=0.01)
+        nn.init.constant_(self.confounder_bias.weight, 0.0)
+        # used when no per-row confounder is given (no --dcr_tag)
+        self.register_buffer('confounder_prior',
+                             torch.tensor(confounder_prior, dtype=torch.float32))
+
+    def forward(self, features, feature_values, confounder=None):
+        if confounder is None:
+            confounder = self.confounder_prior.unsqueeze(0).expand(features.size(0), -1)
+        nonzero_embed = self.embeddings(features) * feature_values.unsqueeze(dim=-1)
+        conf_embed = self.confounder_embed.weight.unsqueeze(0) * confounder.unsqueeze(-1)
+        nonzero_embed = torch.cat([nonzero_embed, conf_embed], 1)
+
+        # Bi-Interaction layer
+        sum_square_embed = nonzero_embed.sum(dim=1).pow(2)
+        square_sum_embed = (nonzero_embed.pow(2)).sum(dim=1)
+
+        # FM model
+        FM = 0.5 * (sum_square_embed - square_sum_embed)
+        FM = self.FM_layers(FM).sum(dim=1, keepdim=True)
+
+        # bias addition
+        feature_bias = (self.biases(features) * feature_values.unsqueeze(dim=-1)).sum(dim=1)
+        conf_bias = confounder @ self.confounder_bias.weight
+        FM = FM + feature_bias + conf_bias + self.bias_
+        return FM.view(-1)
+
+
+class DecFMR(DecFM):
+    """DecRS-R: DecFM's backdoor adjustment plus recency as a covariate.
+
+    The mediator M(d_bar, u) always uses the static prior, so the adjustment is
+    DecRS's valid one whatever is passed as `confounder`. The per-row confounder
+    (--dcr_tag) instead weights a second, separately parameterised table that
+    enters the bi-interaction as ordinary features, exactly as in FMconf. This is
+    the (+adjust, +recency) cell of the {FM, FMconf, DecFM, DecFMR} 2x2.
+
+    The extra features are added in closed form rather than by concatenation:
+    with R = sum of the recency rows and S = sum of the existing rows,
+    0.5*((S+R)^2 - (sq_S + sq_R)) = base + S*R + 0.5*(R^2 - sq_R). This is the
+    same function as FMconf's concat, but with the recency table at zero every
+    term added is an exact 0.0, so DecFMR reproduces DecFM bit for bit
+    (tools/verify_dcr.py, check 3).
+    """
+    def __init__(self, num_features, num_groups, num_factors, batch_norm,
+                 drop_prob, num_user_features, confounder_prior=None):
+        super(DecFMR, self).__init__(num_features, num_groups, num_factors, batch_norm,
+                                     drop_prob, num_user_features, confounder_prior)
+        self.recency_embed = nn.Embedding(num_groups, num_factors)
+        self.recency_bias = nn.Embedding(num_groups, 1)
+        nn.init.normal_(self.recency_embed.weight, std=0.01)
+        nn.init.constant_(self.recency_bias.weight, 0.0)
+
+    def forward(self, features, feature_values, confounder=None):
+        """confounder: optional (N, num_groups) recency weights d_u. When None
+        the static prior is used for them too, as in FMconf."""
+        if confounder is None:
+            confounder = self.confounder_prior.view(1, -1).expand(features.size(0), -1)
+
+        ### U & D => M with the static prior, as in DecFM
+        confounder_part = features[:, -self.num_groups:] - torch.min(features[:, -self.num_groups:])
+        weighted_confounder_embed = self.confounder_embed(confounder_part) * self.confounder_prior
+        user_features = self.embeddings(features[:, :self.num_user_features])
+        weighted_user_features = user_features * feature_values[:, :self.num_user_features].unsqueeze(dim=-1)
+        user_confounder_embed = torch.cat([weighted_user_features, weighted_confounder_embed], 1)
+        user_confounder_mediator = 0.5 * (user_confounder_embed.sum(dim=1).pow(2)
+                                          - (user_confounder_embed.pow(2)).sum(dim=1))
+        user_confounder_mediator = user_confounder_mediator.unsqueeze(dim=1)
+
+        ### U & M & I => Y, with M as one additional feature
+        feature_values = feature_values.unsqueeze(dim=-1)
+        nonzero_embed = self.embeddings(features) * feature_values
+        nonzero_embed = torch.cat([nonzero_embed, user_confounder_mediator], 1)
+        sum_embed = nonzero_embed.sum(dim=1)
+        FM = 0.5 * (sum_embed.pow(2) - (nonzero_embed.pow(2)).sum(dim=1))
+
+        ### recency rows d_u[g] * r_g as ordinary features (see class docstring)
+        rec_embed = self.recency_embed.weight.unsqueeze(0) * confounder.unsqueeze(-1)
+        rec_sum = rec_embed.sum(dim=1)
+        FM = FM + sum_embed * rec_sum + 0.5 * (rec_sum.pow(2) - (rec_embed.pow(2)).sum(dim=1))
+        FM = self.FM_layers(FM).sum(dim=1, keepdim=True)
+
+        # bias addition
+        feature_bias = (self.biases(features) * feature_values).sum(dim=1)
+        rec_bias = confounder @ self.recency_bias.weight
+        FM = FM + feature_bias + rec_bias + self.bias_
         return FM.view(-1)
 
 

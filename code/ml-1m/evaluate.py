@@ -1,46 +1,64 @@
 import numpy as np 
 import torch
+from device import get_device
 import math
 import time
 
 def RMSE(model, model_name, dataloader):
     RMSE = np.array([], dtype=np.float32)
-    for features, feature_values, label in dataloader:
-        features = features.cuda()
-        feature_values = feature_values.cuda()
-        label = label.cuda()
+    for batch in dataloader:
+        conf = None
+        if len(batch) == 4:
+            features, feature_values, label, conf = batch
+            conf = conf.to(get_device())
+        else:
+            features, feature_values, label = batch
+        features = features.to(get_device())
+        feature_values = feature_values.to(get_device())
+        label = label.to(get_device())
 
-        prediction = model(features, feature_values)
+        if conf is None:
+            prediction = model(features, feature_values)
+        else:
+            prediction = model(features, feature_values, conf)
         prediction = prediction.clamp(min=-1.0, max=1.0)
         SE = (prediction - label).pow(2)
         RMSE = np.append(RMSE, SE.detach().cpu().numpy())
 
     return np.sqrt(RMSE.mean())
-
 def pre_ranking(user_feature, item_feature, item_category, num_groups, train_dict, valid_dict, test_dict):
     '''prepare for the ranking: construct input data'''
+
+    dev = get_device()
+    item_idx = list(item_feature.keys())
+
+    # Every user is scored against the same item table, so the item half of the
+    # feature matrix is built once instead of being replicated per user.  The
+    # original layout materialised a (num_users x num_items x num_features)
+    # tensor on the device -- ~6.9 GiB for ml-1m -- which OOMs a 16 GiB card
+    # once model and optimiser state are resident.  Model inputs are unchanged:
+    # the per-user rows are re-assembled by expand+cat inside Ranking().
+    all_item_features = torch.tensor(
+        np.array([item_feature[itemID][0] for itemID in item_idx]), dtype=torch.long, device=dev)
+    all_item_feature_values = torch.tensor(
+        np.array([item_feature[itemID][1] for itemID in item_idx], dtype=np.float32), device=dev)
+
+    item_pos = {itemID: pos for pos, itemID in enumerate(item_idx)}
 
     user_rank_feature = {}
     for userID in test_dict:
         his_items = train_dict[userID]
-        features = []
-        feature_values = []
-        mask = []
-        item_idx = list(item_feature.keys())
-        for idx in range(len(item_idx)):
-            itemID = item_idx[idx]
-            if itemID in his_items: # set as -inf if it's in training set
-                mask.append(-999.0)
-            else:
-                mask.append(0.0)
-            features.append(np.array(user_feature[userID][0]+item_feature[itemID][0]))
-            feature_values.append(np.array(user_feature[userID][1]+item_feature[itemID][1], dtype=np.float32))
-            
-        features = torch.tensor(features).cuda()
-        feature_values = torch.tensor(feature_values).cuda()
-        mask = torch.tensor(mask).cuda()
-        user_rank_feature[userID] = [features, feature_values, mask]
-    
+        mask = np.zeros(len(item_idx), dtype=np.float32)
+        for itemID in his_items: # set as -inf if it's in training set
+            if itemID in item_pos:
+                mask[item_pos[itemID]] = -999.0
+
+        user_feat = torch.tensor(
+            np.array(user_feature[userID][0]), dtype=torch.long, device=dev)
+        user_feat_values = torch.tensor(
+            np.array(user_feature[userID][1], dtype=np.float32), device=dev)
+        user_rank_feature[userID] = [user_feat, user_feat_values, torch.tensor(mask, device=dev)]
+
     user_kl_score = {}
     max_kl_score = 0
     min_kl_score = 999
@@ -55,70 +73,78 @@ def pre_ranking(user_feature, item_feature, item_category, num_groups, train_dic
             min_kl_score = kl_score
     user_kl_score['max_kl_score'] = max_kl_score
     user_kl_score['min_kl_score'] = min_kl_score
-    
-    return user_rank_feature, user_kl_score
+
+    return user_rank_feature, user_kl_score, all_item_features, all_item_feature_values
 
 
-def Ranking(model, model_name, valid_dict, test_dict, train_dict, item_feature, user_rank_feature, user_kl_score, 
-            FM_score, batch_size, topN, num_groups, alpha, return_pred=False):
+def Ranking(model, model_name, valid_dict, test_dict, train_dict, item_feature, user_rank_feature, user_kl_score,
+            all_item_features, all_item_feature_values,
+            FM_score, batch_size, topN, num_groups, alpha, user_confounder=None,
+            return_pred=False):
     """evaluate the performance of top-n ranking by recall, precision, and ndcg"""
+    dev = get_device()
     user_gt_test = []
     user_gt_valid = []
     user_pred_dict = {}
     user_item_top1k = {}
+    item_idx = list(item_feature.keys())
+    num_items = all_item_features.size(0)
+    item_idx_tensor = torch.tensor(item_idx, device=dev)
 
     for userID in test_dict:
-        features, feature_values, mask = user_rank_feature[userID]
-        
-        batch_num = len(item_feature)//batch_size
-        item_idx = list(item_feature.keys())
-        st, ed = 0, batch_size
-        
-        for i in range(batch_num):
-            batch_feature = features[st: ed]
-            batch_feature_values = feature_values[st: ed]
-            batch_mask = mask[st: ed]
-            prediction = model(batch_feature, batch_feature_values)
-            prediction = prediction + batch_mask
-            if i == 0:
-                all_predictions = prediction
-            else:
-                all_predictions = torch.cat([all_predictions, prediction], 0)
-                
-            st, ed = st+batch_size, ed+batch_size
-        
-#         prediction for the last batch
-        batch_feature = features[st:]
-        batch_feature_values = feature_values[st:]
-        batch_mask = mask[st:]
+        user_feat, user_feat_values, mask = user_rank_feature[userID]
+        # DCR: the user's confounder after their whole training history
+        conf_u = None if user_confounder is None else torch.tensor(
+            np.asarray(user_confounder[userID], dtype=np.float32), device=dev)
 
-        prediction = model(batch_feature, batch_feature_values)
-        prediction = prediction + batch_mask
-        if batch_num == 0:
-            all_predictions = prediction
-        else:
-            all_predictions = torch.cat([all_predictions, prediction], 0)
+        chunks = []
+        st = 0
+        while st < num_items:
+            ed = min(st + batch_size, num_items)
+            n = ed - st
+            batch_feature = torch.cat(
+                [user_feat.unsqueeze(0).expand(n, -1), all_item_features[st: ed]], 1)
+            batch_feature_values = torch.cat(
+                [user_feat_values.unsqueeze(0).expand(n, -1), all_item_feature_values[st: ed]], 1)
+            if conf_u is None:
+                prediction = model(batch_feature, batch_feature_values)
+            else:
+                prediction = model(batch_feature, batch_feature_values,
+                                   conf_u.unsqueeze(0).expand(n, -1))
+            chunks.append(prediction + mask[st: ed])
+            st = ed
+        all_predictions = chunks[0] if len(chunks) == 1 else torch.cat(chunks, 0)
+
         user_gt_valid.append(valid_dict[userID])
         user_gt_test.append(test_dict[userID])
         _, indices = torch.topk(all_predictions, topN[-1])
-        pred_items = torch.tensor(item_idx)[indices].cpu().numpy().tolist()
+        pred_items = item_idx_tensor[indices].cpu().numpy().tolist()
         user_item_top1k[userID] = pred_items
         user_pred_dict[userID] = all_predictions.detach().cpu().numpy()
 
+    if FM_score is None:
+        # FM / NFM baselines: no inference blending, rank on the raw scores.
+        user_pred = [user_item_top1k[userID] for userID in test_dict]
+        valid_results = computeTopNAccuracy(user_gt_valid, user_pred, topN)
+        test_results = computeTopNAccuracy(user_gt_test, user_pred, topN)
+        if return_pred:
+            return valid_results, test_results, None, user_pred_dict, user_item_top1k
+        return valid_results, test_results, None
+
     kl_score_gap = user_kl_score['max_kl_score'] - user_kl_score['min_kl_score']
-    
+
     user_pred = []
     for userID in test_dict:
 
-        FM_item_scores = torch.tensor(FM_score[userID]).cuda()
-        all_predictions = torch.tensor(user_pred_dict[userID]).cuda()
+        FM_item_scores = torch.tensor(FM_score[userID]).to(dev)
+        all_predictions = torch.tensor(user_pred_dict[userID]).to(dev)
 
         lamda = ((user_kl_score[userID] - user_kl_score['min_kl_score'])/kl_score_gap)**alpha
 
         DecFM_score =  lamda * torch.sigmoid(all_predictions) + (1-lamda) * torch.sigmoid(FM_item_scores)
 
         _, indices = torch.topk(DecFM_score, topN[-1])
-        pred_items = torch.tensor(item_idx)[indices].cpu().numpy().tolist()
+        pred_items = item_idx_tensor[indices].cpu().numpy().tolist()
 
         user_pred.append(pred_items)
 
@@ -126,11 +152,11 @@ def Ranking(model, model_name, valid_dict, test_dict, train_dict, item_feature, 
     test_results = computeTopNAccuracy(user_gt_test, user_pred, topN)
 #         calibration_results = calibration(item_feature, test_dict, train_dict, user_pred, topN, num_groups)
     calibration_results = None
-            
+
     if return_pred: # used in the inference.py
         return valid_results, test_results, calibration_results, user_pred_dict, user_item_top1k
     return valid_results, test_results, calibration_results
-    
+
 
 def kl_div(p_dis, q_dis, alpha=0.01):
     KL_res = 0

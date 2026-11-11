@@ -1,4 +1,5 @@
 import torch
+from device import get_device
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -26,11 +27,11 @@ class DecFM(nn.Module):
 
         if confounder_prior is not None:
             # \bar{d} in the paper
-            self.confounder_prior = torch.tensor(confounder_prior, dtype=torch.float32).cuda().unsqueeze(dim=-1)
+            self.confounder_prior = torch.tensor(confounder_prior, dtype=torch.float32).to(get_device()).unsqueeze(dim=-1)
         else:
             # confounder prior is assumed as [1/n, 1/n, ..., 1/n]
             self.confounder_prior = \
-                    torch.tensor([1.0/num_groups for x in range(num_groups)]).cuda().unsqueeze(dim=-1)
+                    torch.tensor([1.0/num_groups for x in range(num_groups)]).to(get_device()).unsqueeze(dim=-1)
 
         FM_modules = []
         if self.batch_norm:
@@ -102,10 +103,10 @@ class DecNFM(nn.Module):
         self.batch_norm = batch_norm
         self.drop_prob = drop_prob
         if confounder_prior is not None:
-            self.confounder_prior = torch.tensor(confounder_prior, dtype=torch.float32).cuda().unsqueeze(dim=-1)
+            self.confounder_prior = torch.tensor(confounder_prior, dtype=torch.float32).to(get_device()).unsqueeze(dim=-1)
         else:
             self.confounder_prior = \
-                    torch.tensor([1.0/num_groups for x in range(num_groups)]).cuda().unsqueeze(dim=-1)
+                    torch.tensor([1.0/num_groups for x in range(num_groups)]).to(get_device()).unsqueeze(dim=-1)
             
         self.embeddings = nn.Embedding(num_features, num_factors)
         self.confounder_embed = nn.Embedding(num_groups, num_factors)

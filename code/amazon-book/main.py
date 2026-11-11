@@ -5,6 +5,8 @@ import argparse
 import numpy as np
 
 import torch
+import device
+from device import get_device
 import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as data
@@ -114,11 +116,16 @@ parser.add_argument("--gpu",
     type=str,
     default="3",
     help="gpu card ID")
+parser.add_argument("--num_workers",
+    type=int,
+    default=4,
+    help="DataLoader worker processes. Must be 0 on Windows (spawn re-imports main).")
 args = parser.parse_args()
 print("args:", args)
 
 os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 cudnn.benchmark = True
+print(device.describe(), flush=True)
 
 
 #############################  PREPARE DATASET #########################
@@ -148,7 +155,7 @@ item_category = data_utils.loadData(item_category_path)
 FM_score = data_utils.loadData(FM_score_path)
 
 train_loader = data.DataLoader(train_dataset, drop_last=True,
-            batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True, worker_init_fn=worker_init_fn)
+            batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, worker_init_fn=worker_init_fn)
 
 user_kl_score, all_item_features, all_item_feature_values = evaluate.pre_candidate_ranking(train_dataset.train_dict, \
                        valid_dict, test_dict, item_category, num_groups, item_feature)
@@ -158,7 +165,7 @@ print('data ready. costs ' + time.strftime("%H: %M: %S", time.gmtime(time.time()
 if args.pre_train:
     assert os.path.exists(args.pre_train_model_path), 'lack of FM model'
     assert args.model == 'NFM', 'only support NFM for now'
-    FM_model = torch.load(args.pre_train_model_path)
+    FM_model = torch.load(args.pre_train_model_path, map_location=get_device(), weights_only=False)
 else:
     FM_model = None
 
@@ -173,7 +180,7 @@ else:
     raise Exception('model not implemented!')
     
 
-model.cuda()
+model.to(get_device())
 if args.optimizer == 'Adagrad':
     optimizer = optim.Adagrad(
         model.parameters(), lr=args.lr, initial_accumulator_value=1e-8)
@@ -193,7 +200,7 @@ else:
 
 ###############################  TRAINING ############################
 
-count, best_recall = 0, -100
+count, best_recall, best_epoch = 0, -100, -1
 best_valid_loss = 999999
 
 for epoch in range(args.epochs):
@@ -202,9 +209,9 @@ for epoch in range(args.epochs):
     train_loader.dataset.ng_sample() # ng sampling for epoch training.
     
     for features, feature_values, label in train_loader:
-        features = features.cuda()
-        feature_values = feature_values.cuda()
-        label = label.cuda()
+        features = features.to(get_device())
+        feature_values = feature_values.to(get_device())
+        label = label.to(get_device())
 
         model.zero_grad()
         prediction = model(features, feature_values)
@@ -242,7 +249,7 @@ for epoch in range(args.epochs):
         print("evaluation costs " + time.strftime("%H: %M: %S", time.gmtime(time.time()-start_time)))
 
 print("Training End. Best epoch {:03d}".format(best_epoch))
-testing_model = torch.load('{}{}_{}_{}lr_{}bs_{}dropout_{}alpha_{}lamda.pth'.format(
+testing_model = torch.load(map_location=get_device(), weights_only=False, f='{}{}_{}_{}lr_{}bs_{}dropout_{}alpha_{}lamda.pth'.format(
                     args.model_path, args.model, args.dataset, args.lr,\
                     args.batch_size, args.dropout, args.alpha, args.lamda))
 testing_model.eval()

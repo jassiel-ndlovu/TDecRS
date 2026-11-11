@@ -1,0 +1,45 @@
+# Data: only upstream's ml_1m and amazon_book are tracked; the rest is on Google Drive
+data/
+
+# Local environment
+venv/
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+
+# Machine-specific infrastructure (cloud configs and job scripts)
+aws/
+azure/
+track.sh
+
+# Run outputs: logs, checkpoints, score files (on Google Drive)
+results/
+results-*/
+partial-*/
+code/*/log/*
+!code/*/log/.gitkeep
+code/*/models/
+code/*/inference/*.npy
+*.pth
+
+# Notes and drafts that are not part of the code
+docs/
+
+# analysis/: keep the scripts and the protocol/README files, not their outputs
+analysis/**/*.npz
+analysis/**/*.npy
+analysis/**/*.json
+analysis/**/*.log
+analysis/**/*.csv
+analysis/**/*.txt
+analysis/**/*.png
+analysis/**/*.pdf
+analysis/**/*.tex
+analysis/**/topk*/
+analysis/**/cache/
+analysis/**/out/
+analysis/**/logs/
+analysis/audit/q3/gr300/
